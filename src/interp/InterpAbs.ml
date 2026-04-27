@@ -51,7 +51,7 @@ let convert_value_to_abstractions (span : Meta.span) (abs_kind : abs_kind)
   [%ltrace tvalue_to_string ctx v];
   (* Convert the value to a list of avalues *)
   let absl = ref [] in
-  let push_abs (r_id : RegionId.id) (avalues : tavalue list)
+  let push_abs_with_regions (owned : RegionId.Set.t) (avalues : tavalue list)
       (output : tevalue option) (input : tevalue option) : unit =
     if avalues = [] then ()
     else begin
@@ -73,7 +73,7 @@ let convert_value_to_abstractions (span : Meta.span) (abs_kind : abs_kind)
           kind = abs_kind;
           can_end;
           parents = AbsId.Set.empty;
-          regions = { owned = RegionId.Set.singleton r_id };
+          regions = { owned };
           ended_subabs = AbsLevelSet.empty;
           avalues;
           cont = Some { output = Some output; input = Some input };
@@ -84,6 +84,9 @@ let convert_value_to_abstractions (span : Meta.span) (abs_kind : abs_kind)
       (* Add to the list of abstractions *)
       absl := abs :: !absl
     end
+  in
+  let push_abs (r_id : RegionId.id) =
+    push_abs_with_regions (RegionId.Set.singleton r_id)
   in
 
   (* We only call this on values inside mutable borrows *)
@@ -145,19 +148,24 @@ let convert_value_to_abstractions (span : Meta.span) (abs_kind : abs_kind)
     | VAdt { variant_id = _; fields } -> List.iter to_abs fields
     | VBorrow bc -> (
         let _, ref_ty, kind = ty_as_ref v.ty in
-        [%cassert] span (ty_no_regions ref_ty)
-          "Nested borrows are not supported yet";
         match bc with
         | VSharedBorrow (bid, sid) ->
             (* Push a region abstraction for this borrow *)
+            let fresh_regions, ref_ty =
+              ty_refresh_regions (Some span) ctx.fresh_region_id ref_ty
+            in
             let rid = ctx.fresh_region_id () in
             let ty = TRef (RVar (Free rid), ref_ty, kind) in
             let value = ABorrow (ASharedBorrow (PNone, bid, sid)) in
             let value : tavalue = { value; ty } in
             let ev_out = Some (mk_etuple ~borrow_proj:true []) in
             let ev_in = Some (mk_etuple ~borrow_proj:false []) in
-            push_abs rid [ value ] ev_out ev_in
+            push_abs_with_regions
+              (RegionId.Set.of_list (rid :: fresh_regions))
+              [ value ] ev_out ev_in
         | VMutBorrow (bid, bv) ->
+            [%cassert] span (ty_no_regions ref_ty)
+              "Nested borrows are not supported yet";
             (* We don't support nested borrows for now *)
             [%cassert] span
               (not (value_has_borrows (Some span) ctx bv.value))
@@ -444,8 +452,7 @@ let convert_value_to_input_avalues (span : Meta.span) (ctx : eval_ctx)
 
     Note that this function supports projection markers: when merging two
     borrows we take the union of the markers. *)
-let abs_simplify_duplicated_borrows (_span : Meta.span) (_ctx : eval_ctx)
-    (abs : abs) : abs =
+let abs_simplify_duplicated_borrows (abs : abs) : abs =
   let join_pm (pm0 : proj_marker) (pm1 : proj_marker) : proj_marker =
     match (pm0, pm1) with
     | PNone, _ | _, PNone -> PNone
@@ -629,6 +636,10 @@ let tavalue_split_marker (span : Meta.span) (ctx : eval_ctx) (av : tavalue) :
             { av with value = ABorrow (ASharedBorrow (pm, bid, sid)) }
           in
           mk_opt_split pm mk_value
+      | AProjSharedBorrow _ ->
+          (* Projected shared borrows already describe a set of reborrows, not
+             a left/right marked value to split. *)
+          [ av ]
       | _ -> [%internal_error] span)
   | ALoan lc -> (
       match lc with
@@ -641,7 +652,7 @@ let tavalue_split_marker (span : Meta.span) (ctx : eval_ctx) (av : tavalue) :
       | ASharedLoan (pm, bids, sv, child) ->
           [%sanity_check] span (is_aignored child.value);
           [%sanity_check] span
-            (not (value_has_borrows (Some span) ctx sv.value));
+            (not (value_has_mut_borrows (Some span) ctx sv.value));
           let mk_value pm =
             { av with value = ALoan (ASharedLoan (pm, bids, sv, child)) }
           in
@@ -762,6 +773,47 @@ let merge_abstractions_merge_loan_borrow_pairs (span : Meta.span)
   let push_right_avalue (av : tavalue) : unit =
     right_avalues := av :: !right_avalues
   in
+  let has_matching_shared_loan ?pm bid (avl : tavalue list) : bool =
+    List.exists
+      (fun (av : tavalue) ->
+        match av.value with
+        | ALoan (ASharedLoan (pm', bid', _, _)) ->
+            bid = bid'
+            && (match pm with None -> true | Some pm -> pm = pm')
+        | _ -> false)
+      avl
+  in
+  let has_matching_projected_shared_borrow bid (avl : tavalue list) : bool =
+    List.exists
+      (fun (av : tavalue) ->
+        match av.value with
+        | ABorrow (AProjSharedBorrow asb) ->
+            List.exists
+              (function
+                | AsbBorrow (bid', _) -> bid = bid'
+                | AsbProjReborrows _ -> false)
+              asb
+        | _ -> false)
+      avl
+  in
+  let filter_projected_shared_borrow_entries keep_bid
+      (avl : tavalue list) : tavalue list =
+    let update (av : tavalue) : tavalue option =
+      match av.value with
+      | ABorrow (AProjSharedBorrow asb) ->
+          let asb =
+            List.filter
+              (function
+                | AsbBorrow (bid, _) -> keep_bid bid
+                | AsbProjReborrows _ -> true)
+              asb
+          in
+          if asb = [] then None
+          else Some { av with value = ABorrow (AProjSharedBorrow asb) }
+      | _ -> Some av
+    in
+    List.filter_map update avl
+  in
 
   let rec add_avalue (av : tavalue) : unit =
     match av.value with
@@ -807,24 +859,35 @@ let merge_abstractions_merge_loan_borrow_pairs (span : Meta.span)
               left_avalues := avalues;
               if keep then push_right_avalue av else ()
           | ASharedBorrow (pm, bid, _) ->
-              let rec keep (avl : tavalue list) : bool =
-                match avl with
-                | [] -> true
-                | av :: avl -> (
-                    match av.value with
-                    | ALoan (ASharedLoan (pm', bid', _, _))
-                      when pm = pm' && bid = bid' -> false
-                    | _ -> keep avl)
+              let keep =
+                not (has_matching_shared_loan ~pm bid !left_avalues)
               in
-              let keep = keep !left_avalues in
+              left_avalues :=
+                filter_projected_shared_borrow_entries
+                  (fun bid' -> bid' <> bid)
+                  !left_avalues;
               if keep then push_right_avalue av else ()
           | AEndedIgnoredMutBorrow { child; given_back; given_back_meta = _ } ->
               add_avalue given_back;
               add_avalue child
+          | AProjSharedBorrow asb ->
+              let asb =
+                List.filter
+                  (function
+                    | AsbBorrow (bid, _) ->
+                        (not (has_matching_shared_loan bid !left_avalues))
+                        && not
+                             (has_matching_projected_shared_borrow bid
+                                !left_avalues)
+                    | AsbProjReborrows _ -> true)
+                  asb
+              in
+              if asb <> [] then
+                push_right_avalue
+                  { av with value = ABorrow (AProjSharedBorrow asb) }
           | AIgnoredMutBorrow _
           | AEndedMutBorrow _
-          | AEndedSharedBorrow
-          | AProjSharedBorrow _ ->
+          | AEndedSharedBorrow ->
               [%ltrace "Unexpected avalue: " ^ tavalue_to_string ctx av];
               [%craise] span "Unreachable"
         end
@@ -2026,8 +2089,8 @@ let merge_abstractions (span : Meta.span) (abs_kind : abs_kind)
   in
 
   (* Simplify the duplicated shared borrows - TODO: is this really necessary? *)
-  let abs0 = abs_simplify_duplicated_borrows span ctx abs0 in
-  let abs1 = abs_simplify_duplicated_borrows span ctx abs1 in
+  let abs0 = abs_simplify_duplicated_borrows abs0 in
+  let abs1 = abs_simplify_duplicated_borrows abs1 in
 
   [%ldebug
     "After simplifying the duplicated shared borrows:\n- abs0:\n"
@@ -2258,7 +2321,7 @@ let reorder_loans_borrows_in_fresh_abs (span : Meta.span) (allow_markers : bool)
               [%cassert] span (is_aignored child.value) "Not supported yet";
               [%cassert] span (is_aignored given_back.value) "Not supported yet";
               false
-          | AProjSharedBorrow _ -> [%craise] span "Not supported yet")
+          | AProjSharedBorrow asb -> asb <> [])
       | AIgnored _ -> false
     in
     let avalues = List.filter filter abs.avalues in
@@ -2295,11 +2358,40 @@ let reorder_loans_borrows_in_fresh_abs (span : Meta.span) (allow_markers : bool)
          borrows, borrow projectors, loans, loan projectors
        (all sorted by increasing id)
     *)
-    let get_borrow_id (av : tavalue) : BorrowId.id =
+    let compare_shared_borrow_id_opt sid0 sid1 =
+      match (sid0, sid1) with
+      | None, None -> 0
+      | None, Some _ -> -1
+      | Some _, None -> 1
+      | Some sid0, Some sid1 -> compare_shared_borrow_id sid0 sid1
+    in
+    let compare_borrow_key (bid0, sid0) (bid1, sid1) =
+      let cmp = compare_borrow_id bid0 bid1 in
+      if cmp <> 0 then cmp else compare_shared_borrow_id_opt sid0 sid1
+    in
+    let get_borrow_key (av : tavalue) :
+        BorrowId.id * SharedBorrowId.id option =
       match av.value with
-      | ABorrow (AMutBorrow (pm, bid, _) | ASharedBorrow (pm, bid, _)) ->
+      | ABorrow (AMutBorrow (pm, bid, _)) ->
           [%sanity_check] span (allow_markers || pm = PNone);
-          bid
+          (bid, None)
+      | ABorrow (ASharedBorrow (pm, bid, sid)) ->
+          [%sanity_check] span (allow_markers || pm = PNone);
+          (bid, Some sid)
+      | ABorrow (AProjSharedBorrow asb) -> (
+          let ids =
+            List.filter_map
+              (function
+                | AsbBorrow (bid, sid) -> Some (bid, Some sid)
+                | AsbProjReborrows _ -> None)
+              asb
+          in
+          match ids with
+          | [] -> [%craise] span "Unexpected projected shared borrow"
+          | id :: ids ->
+              List.fold_left
+                (fun id id' -> if compare_borrow_key id' id < 0 then id' else id)
+                id ids)
       | _ -> [%craise] span ("Unexpected value: " ^ tavalue_to_string ctx av)
     in
     let get_loan_id (av : tavalue) : BorrowId.id =
@@ -2342,7 +2434,7 @@ let reorder_loans_borrows_in_fresh_abs (span : Meta.span) (allow_markers : bool)
       let values = List.map (fun v -> (get_id v, v)) values in
       List.map snd (List.stable_sort (compare_pair compare_id) values)
     in
-    let aborrows = reorder get_borrow_id compare_borrow_id aborrows in
+    let aborrows = reorder get_borrow_key compare_borrow_key aborrows in
     let borrow_projs =
       reorder get_symbolic_id compare_symbolic_value_id borrow_projs
     in
@@ -2667,12 +2759,11 @@ let add_abs_cont_to_abs span (ctx : eval_ctx) (abs : abs) (abs_fun : abs_fun) :
               EBorrow (EMutBorrow (pm, bid, mk_eignored child.ty))
             in
             borrows := { value; ty } :: !borrows
-        | ASharedBorrow _ -> (* We ignore shared borrows *) ()
+        | ASharedBorrow _ | AProjSharedBorrow _ -> (* We ignore shared borrows *) ()
         | AIgnoredMutBorrow _
         | AEndedMutBorrow _
         | AEndedSharedBorrow
-        | AEndedIgnoredMutBorrow _
-        | AProjSharedBorrow _ -> [%internal_error] span)
+        | AEndedIgnoredMutBorrow _ -> [%internal_error] span)
     | ASymbolic (pm, aproj) -> (
         match aproj with
         | AProjLoans { proj = { sv_id; proj_ty }; consumed; borrows } ->

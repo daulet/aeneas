@@ -49,6 +49,11 @@ val convert_value_to_input_avalues :
   RegionId.id ->
   tavalue list * tevalue
 
+(** Remove redundant shared borrows from an abstraction. Shared borrows are
+    non-unique, so several entries with the same borrow id can be represented by
+    one entry. *)
+val abs_simplify_duplicated_borrows : abs -> abs
+
 (** See {!merge_into_abstraction}.
 
     Rem.: it may be more idiomatic to have a functor, but this seems a bit

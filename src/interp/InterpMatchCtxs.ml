@@ -55,6 +55,7 @@ let compute_abs_borrows_loans_maps (span : Meta.span) (explore : abs -> bool)
           (fun ids ->
             match ids with
             | None -> Some (S.singleton id1)
+            | Some ids when S.mem id1 ids -> Some ids
             | Some ids ->
                 (* Check that we are allowed to map id0 to a set which is not
                    a singleton *)
@@ -62,12 +63,6 @@ let compute_abs_borrows_loans_maps (span : Meta.span) (explore : abs -> bool)
                   [%craise] span
                     ("Internal error, please file an issue.\n\
                       Key already registered: " ^ to_string id0 id1);
-                (* Check that the mapping was not already registered *)
-                if S.mem id1 ids then
-                  [%craise] span
-                    ("Internal error, please file an issue.\n\
-                      Found an already registered mapping: " ^ to_string id0 id1
-                    );
                 (* Update *)
                 Some (S.add id1 ids))
           !map
@@ -116,18 +111,28 @@ let compute_abs_borrows_loans_maps (span : Meta.span) (explore : abs -> bool)
     "@loan_proj(" ^ marked_norm_symb_proj_to_string ctx x ^ ")"
   in
   let register_borrow_id (abs : abs) pm bid sid =
+    let non_unique_borrow = (pm, bid) in
     RAbsUniqueBorrow.register_mapping
       (binding_to_string abs_id_to_string uborrow_to_string)
       false abs_to_borrows abs.abs_id (pm, bid, sid);
     RAbsBorrow.register_mapping
       (binding_to_string abs_id_to_string borrow_to_string)
-      false abs_to_non_unique_borrows abs.abs_id (pm, bid);
+      false abs_to_non_unique_borrows abs.abs_id non_unique_borrow;
     RUniqueBorrowAbs.register_mapping
       (binding_to_string uborrow_to_string abs_id_to_string)
       true borrow_to_abs (pm, bid, sid) abs.abs_id;
     RBorrowAbs.register_mapping
       (binding_to_string borrow_to_string abs_id_to_string)
-      false non_unique_borrow_to_abs (pm, bid) abs.abs_id
+      false non_unique_borrow_to_abs non_unique_borrow abs.abs_id
+  in
+  let register_non_unique_borrow_id (abs : abs) pm bid =
+    let non_unique_borrow = (pm, bid) in
+    RAbsBorrow.register_mapping
+      (binding_to_string abs_id_to_string borrow_to_string)
+      false abs_to_non_unique_borrows abs.abs_id non_unique_borrow;
+    RBorrowAbs.register_mapping
+      (binding_to_string borrow_to_string abs_id_to_string)
+      false non_unique_borrow_to_abs non_unique_borrow abs.abs_id
   in
 
   let register_loan_id (abs : abs) pm bid =
@@ -168,6 +173,9 @@ let compute_abs_borrows_loans_maps (span : Meta.span) (explore : abs -> bool)
   let explore_abs =
     object (self : 'self)
       inherit [_] iter_tavalue as super
+
+      method! visit_VSharedBorrow (abs, pm) bid sid =
+        register_borrow_id abs pm bid (Some sid)
 
       (** Make sure we don't register the ignored ids *)
       method! visit_aloan_content (abs, pm) lc =
@@ -214,10 +222,14 @@ let compute_abs_borrows_loans_maps (span : Meta.span) (explore : abs -> bool)
         | ASharedBorrow (npm, bid, sid) ->
             (* Add the current marker when visiting the borrow id *)
             register_borrow_id abs npm bid (Some sid)
-        | AProjSharedBorrow _ ->
+        | AProjSharedBorrow asb ->
             [%sanity_check] span (pm = PNone);
-            (* Process those normally *)
-            super#visit_aborrow_content (abs, pm) bc
+            List.iter
+              (fun asb ->
+                match asb with
+                | AsbBorrow (bid, _) -> register_non_unique_borrow_id abs pm bid
+                | AsbProjReborrows proj -> register_borrow_proj abs pm proj)
+              asb
         | AIgnoredMutBorrow (_, child)
         | AEndedIgnoredMutBorrow { child; given_back = _; given_back_meta = _ }
           ->
@@ -356,13 +368,6 @@ module MakeMatcher (M : PrimMatcher) : Matcher = struct
       ^ tvalue_to_string ctx1 v1];
     let match_rec = match_tvalues ctx0 ctx1 in
     let ty = M.match_etys ctx0 ctx1 v0.ty v1.ty in
-    (* Using ValuesUtils.value_ has_borrows on purpose here: we want
-       to make explicit the fact that, though we have to pick
-       one of the two contexts (ctx0 here) to call value_has_borrows,
-       it doesn't matter here. *)
-    let value_has_borrows =
-      ValuesUtils.value_has_borrows (Some span) ctx0.type_ctx.type_infos
-    in
     match (v0.value, v1.value) with
     | VLiteral lv0, VLiteral lv1 ->
         if lv0 = lv1 then v1
@@ -390,6 +395,9 @@ module MakeMatcher (M : PrimMatcher) : Matcher = struct
                 M.match_mut_borrows match_rec ctx0 ctx1 ty bid0 bv0 bid1 bv1 bv
               in
               VMutBorrow (bid, bv)
+          | VReservedMutBorrow (bid0, sid0), VReservedMutBorrow (bid1, sid1)
+            when bid0 = bid1 && sid0 = sid1 ->
+              VReservedMutBorrow (bid0, sid0)
           | VReservedMutBorrow _, _
           | _, VReservedMutBorrow _
           | VSharedBorrow _, VMutBorrow _
@@ -406,7 +414,9 @@ module MakeMatcher (M : PrimMatcher) : Matcher = struct
         | VSharedLoan (id0, sv0), VSharedLoan (id1, sv1) ->
             let sv = match_rec sv0 sv1 in
             [%cassert_recover] M.recover M.span
-              (not (value_has_borrows sv.value))
+              (not
+                 (ValuesUtils.value_has_mut_borrows (Some M.span)
+                    ctx0.type_ctx.type_infos sv.value))
               "The join of nested borrows is not supported yet";
             M.match_shared_loans match_rec ctx0 ctx1 ty id0 id1 sv
         | VMutLoan id0, VMutLoan id1 ->
@@ -520,15 +530,47 @@ module MakeMatcher (M : PrimMatcher) : Matcher = struct
             let given_back = match_arec given_back0 given_back1 in
             M.match_aended_ignored_mut_borrow match_rec ctx0 ctx1 (v0.ty, bc0)
               (v1.ty, bc1) ty child given_back
-        | AProjSharedBorrow asb0, AProjSharedBorrow asb1 -> (
-            match (asb0, asb1) with
-            | [], [] ->
-                (* This case actually stands for ignored shared borrows, when
-                   there are no nested borrows *)
-                v0
-            | _ ->
-                (* We should get there only if there are nested borrows *)
-                [%craise_recover] M.recover M.span "Unexpected")
+        | AProjSharedBorrow asb0, AProjSharedBorrow asb1 ->
+            let compare_symbolic_proj (proj0 : symbolic_proj)
+                (proj1 : symbolic_proj) =
+              let cmp = compare_symbolic_value_id proj0.sv_id proj1.sv_id in
+              if cmp <> 0 then cmp else Stdlib.compare proj0.proj_ty proj1.proj_ty
+            in
+            let compare_asb asb0 asb1 =
+              match (asb0, asb1) with
+              | AsbBorrow (bid0, sid0), AsbBorrow (bid1, sid1) ->
+                  let cmp = compare_borrow_id bid0 bid1 in
+                  if cmp <> 0 then cmp else compare_shared_borrow_id sid0 sid1
+              | AsbBorrow _, AsbProjReborrows _ -> -1
+              | AsbProjReborrows _, AsbBorrow _ -> 1
+              | AsbProjReborrows proj0, AsbProjReborrows proj1 ->
+                  compare_symbolic_proj proj0 proj1
+            in
+            let asb0 = List.stable_sort compare_asb asb0 in
+            let asb1 = List.stable_sort compare_asb asb1 in
+            [%cassert_recover] M.recover M.span
+              (List.length asb0 = List.length asb1)
+              "Unexpected";
+            let match_asb asb0 asb1 =
+              match (asb0, asb1) with
+              | AsbBorrow (bid0, sid0), AsbBorrow (bid1, sid1) ->
+                  let bid, sid =
+                    M.match_shared_borrows match_rec ctx0 ctx1 ty bid0 sid0
+                      bid1 sid1
+                  in
+                  AsbBorrow (bid, sid)
+              | AsbProjReborrows proj0, AsbProjReborrows proj1 ->
+                  [%cassert_recover] M.recover M.span (proj0 = proj1)
+                    "Unexpected";
+                  AsbProjReborrows proj0
+              | _ -> [%craise_recover] M.recover M.span "Unexpected"
+            in
+            let asb =
+              List.map
+                (fun (asb0, asb1) -> match_asb asb0 asb1)
+                (List.combine asb0 asb1)
+            in
+            { value = ABorrow (AProjSharedBorrow asb); ty }
         | _ ->
             (* TODO: getting there is not necessarily inconsistent (it may
                just be because the environments don't match) so we may want
@@ -1482,16 +1524,16 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
       (lid : loan_id) (shared_value : tvalue) (other : tvalue) : tvalue =
     (* Sanity checks *)
     [%cassert_recover] S.recover span
-      (not (ety_has_nested_borrows (Some span) ctx0.type_ctx.type_infos ty))
+      (not (TypesUtils.ty_has_mut_borrows ctx0.type_ctx.type_infos ty))
       "Unimplemented";
     [%cassert_recover] S.recover span
       (not
-         (ValuesUtils.value_has_loans_or_borrows (Some span)
+         (ValuesUtils.value_has_mut_borrows (Some span)
             ctx0.type_ctx.type_infos shared_value.value))
       "Unimplemented";
     [%cassert_recover] S.recover span
       (not
-         (ValuesUtils.value_has_borrows (Some span) ctx0.type_ctx.type_infos
+         (ValuesUtils.value_has_mut_borrows (Some span) ctx0.type_ctx.type_infos
             other.value))
       "Unimplemented";
 
@@ -1505,8 +1547,10 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
     let rid = ctx0.fresh_region_id () in
     let nbid = ctx0.fresh_borrow_id () in
 
+    let fresh_regions, bv_ty =
+      ty_refresh_regions (Some span) ctx0.fresh_region_id ty
+    in
     let kind = RShared in
-    let bv_ty = ty in
     let borrow_ty = mk_ref_ty (RVar (Free rid)) bv_ty kind in
 
     let borrow_av =
@@ -1528,7 +1572,7 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
 
     let avalues = [ borrow_av; loan_av ] in
 
-    let owned = RegionId.Set.singleton rid in
+    let owned = RegionId.Set.of_list (rid :: fresh_regions) in
     let cont : abs_cont option =
       if S.with_abs_conts then
         Some
@@ -1980,11 +2024,20 @@ struct
            ^ Print.bool_to_string bottom_is_left
            ^ "\n- value to match with bottom:\n" ^ show_tvalue v))
 
-  let match_shared_loan_with_other (_ : tvalue_matcher) (_ : eval_ctx)
-      (_ : eval_ctx) ~(loan_is_left : bool) (_ : ety) (_ : loan_id) (_ : tvalue)
-      (_ : tvalue) : tvalue =
-    let _ = loan_is_left in
-    raise (Distinct "match_mut_loan_with_other")
+  let match_shared_loan_with_other (match_tvalues : tvalue -> tvalue -> tvalue)
+      (ctx0 : eval_ctx) (_ctx1 : eval_ctx) ~(loan_is_left : bool) (_ : ety)
+      (_ : loan_id) (sv : tvalue) (other : tvalue) : tvalue =
+    if S.check_equiv then raise (Distinct "match_shared_loan_with_other")
+    else (
+      [%sanity_check_recover] S.recover span
+        (not
+           (ValuesUtils.value_has_mut_borrows (Some span)
+              ctx0.type_ctx.type_infos sv.value));
+      [%sanity_check_recover] S.recover span
+        (not
+           (ValuesUtils.value_has_mut_borrows (Some span)
+              ctx0.type_ctx.type_infos other.value));
+      if loan_is_left then match_tvalues sv other else match_tvalues other sv)
 
   let match_mut_loan_with_other (_ : tvalue_matcher) (_ : eval_ctx)
       (_ : eval_ctx) ~(loan_is_left : bool) (_ : ety) (_ : loan_id) (_ : tvalue)
@@ -2259,6 +2312,8 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
   (* Rem.: this function raises exceptions of type [Distinct] or [RFailure]
      (in the latter case: if [recover] is true) *)
   let match_abstractions ~(recover : bool) (abs0 : abs) (abs1 : abs) : unit =
+    let abs0 = abs_simplify_duplicated_borrows abs0 in
+    let abs1 = abs_simplify_duplicated_borrows abs1 in
     let {
       abs_id = abs_id0;
       kind = kind0;
