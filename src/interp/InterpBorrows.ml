@@ -1640,9 +1640,7 @@ and end_proj_loans_symbolic (config : config) (span : Meta.span)
   | Some (NonSharedProj (abs_id', _proj_ty, level')) ->
       (* We found one projector of borrows in an abstraction: end the abstraction
          at the corresponding level. *)
-      let ctx, cc =
-        end_abs_aux config span ~snapshots chain abs_id' level' ctx
-      in
+      let ctx, cc = end_abs_aux config span ~snapshots chain abs_id' level' ctx in
       (* Retry ending the projector of loans *)
       let ctx, cc =
         comp cc
@@ -2010,15 +2008,19 @@ let destructure_abs (span : Meta.span) (abs_kind : abs_kind) ~(can_end : bool)
         | AEndedMutLoan
             { child = child_av; given_back = _; given_back_meta = _ }
         | AEndedIgnoredMutLoan
-            { child = child_av; given_back = _; given_back_meta = _ }
-        | AIgnoredSharedLoan child_av ->
+            { child = child_av; given_back = _; given_back_meta = _ } ->
             (* We don't support nested borrows for now *)
             [%cassert] span
               (not
                  (ty_has_borrows (Some span) ctx.type_ctx.type_infos child_av.ty))
               "Nested borrows are not supported yet";
             (* Simply explore the child *)
-            list_avalues 0 push_fail child_av)
+            list_avalues 0 push_fail child_av
+        | AIgnoredSharedLoan child_av ->
+            (* The shared reborrow dependencies are tracked separately through
+               AProjSharedBorrow values, so the ignored shared loan can be
+               recursively destructured like other shared-loan children. *)
+            list_avalues 0 push child_av)
     | ABorrow bc -> (
         (* Sanity check - rem.: may be redundant with [push_fail] *)
         [%sanity_check] span (allow_borrows > 0);
@@ -2050,11 +2052,10 @@ let destructure_abs (span : Meta.span) (abs_kind : abs_kind) ~(can_end : bool)
             list_avalues allow_borrows push_avalue child_av;
             list_avalues allow_borrows push_avalue given_back
         | AProjSharedBorrow asb ->
-            (* We don't support nested borrows *)
-            [%cassert] span (asb = [])
-              "Found a case of unsupported nested borrows";
-            (* Nothing specific to do *)
-            ()
+            (* Projected shared borrows are already flat: they don't contain a
+               child avalue to destructure. Preserve non-empty projectors so
+               later phases can keep tracking the shared reborrows. *)
+            if asb <> [] then push av
         | AEndedMutBorrow _ | AEndedSharedBorrow ->
             (* If we get there it means the abstraction ended: it should not
                be in the context anymore (if we end *one* borrow in an abstraction,
@@ -2113,20 +2114,21 @@ let destructure_abs (span : Meta.span) (abs_kind : abs_kind) ~(can_end : bool)
            meaning we can't read x any more (but we can write to x).
         *)
         ([], v)
-    | VBorrow _ ->
-        (* We don't support nested borrows for now *)
+    | VBorrow (VSharedBorrow _) ->
+        ([], v)
+    | VBorrow (VMutBorrow _ | VReservedMutBorrow _) ->
+        (* Mutable borrows inside shared values still require the general
+           nested-borrow machinery. *)
         [%craise] span "Unreachable"
     | VLoan lc -> (
         match lc with
         | VSharedLoan (bids, sv) ->
             let avl, sv = list_values sv in
-            if destructure_shared_values then (
-              (* Rem.: the shared value can't contain loans nor borrows *)
-              [%cassert] span (ty_no_regions ty)
-                "Nested borrows are not supported yet";
+            if
+              destructure_shared_values && ty_no_regions ty
+              && not (value_has_loans_or_borrows (Some span) ctx sv.value)
+            then (
               let av : tavalue =
-                [%sanity_check] span
-                  (not (value_has_loans_or_borrows (Some span) ctx sv.value));
                 (* We introduce fresh ids for the symbolic values *)
                 let mk_value_with_fresh_sids (v : tvalue) : tvalue =
                   let visitor =
@@ -2356,6 +2358,92 @@ let rec simplify_dummy_values_useless_abs_aux (config : config)
  fun ctx ->
   let simplify_abs = true in
   let simplify_borrows = true in
+  let abs_has_projected_shared_borrows (abs : abs) : bool =
+    let visitor =
+      object
+        inherit [_] iter_abs
+
+        method! visit_AProjSharedBorrow _ asb =
+          if asb <> [] then raise Found
+      end
+    in
+    try
+      visitor#visit_abs () abs;
+      false
+    with Found -> true
+  in
+  let abs_projected_shared_borrow_ids (abs : abs) : BorrowId.Set.t =
+    let bids = ref BorrowId.Set.empty in
+    let visitor =
+      object
+        inherit [_] iter_abs
+
+        method! visit_AProjSharedBorrow _ asb =
+          List.iter
+            (function
+              | AsbBorrow (bid, _) -> bids := BorrowId.Set.add bid !bids
+              | AsbProjReborrows _ -> ())
+            asb
+      end
+    in
+    visitor#visit_abs () abs;
+    !bids
+  in
+  let abs_projected_loan_sids (abs : abs) : SymbolicValueId.Set.t =
+    let sids = ref SymbolicValueId.Set.empty in
+    let visitor =
+      object
+        inherit [_] iter_abs
+
+        method! visit_AProjLoans _ proj =
+          sids := SymbolicValueId.Set.add proj.proj.sv_id !sids
+      end
+    in
+    visitor#visit_abs () abs;
+    !sids
+  in
+  let symbolic_value_id_in_bindings (ctx : eval_ctx)
+      (sid : SymbolicValueId.id) : bool =
+    let visitor =
+      object
+        (self)
+        inherit [_] iter_env as super
+
+        method! visit_EAbs _ _ = ()
+
+        method! visit_EBinding _ binder v =
+          match binder with
+          | BVar _ -> self#visit_tvalue () v
+          | BDummy _ -> ()
+
+        method! visit_VSymbolic _ sv =
+          if sv.sv_id = sid then raise Found
+          else super#visit_VSymbolic () sv
+      end
+    in
+    try
+      visitor#visit_env () ctx.env;
+      false
+    with Found -> true
+  in
+  let abs_has_live_projected_loan (ctx : eval_ctx) (abs : abs) : bool =
+    SymbolicValueId.Set.exists
+      (symbolic_value_id_in_bindings ctx)
+      (abs_projected_loan_sids abs)
+  in
+  let projected_shared_borrows_covered_by_live_projector (ctx : eval_ctx)
+      (abs : abs) : bool =
+    let bids = abs_projected_shared_borrow_ids abs in
+    (not (BorrowId.Set.is_empty bids))
+    && List.exists
+         (fun (other : abs) ->
+           other.abs_id <> abs.abs_id
+           && abs_has_live_projected_loan ctx other
+           && not
+                (BorrowId.Set.disjoint bids
+                   (abs_projected_shared_borrow_ids other)))
+         (AbsId.Map.values (env_get_abs ctx.env))
+  in
   (* Small utilities: we do not modify the region abstractions marked as frozen
      (i.e., which should not be ended) - it is usually important that those remain
      the same, for instance when computing fixed points. *)
@@ -2530,7 +2618,11 @@ let rec simplify_dummy_values_useless_abs_aux (config : config)
             (* There are remaining loans: we can't end the abstraction *)
             (* Check if we can end some loan projectors (because there doesn't
                remain corresponding borrow projectors in the context) *)
-            find_first_endable_loan_proj_in_abs span ctx abs;
+            if
+              (not (abs_has_projected_shared_borrows abs))
+              || projected_shared_borrows_covered_by_live_projector ctx abs
+            then
+              find_first_endable_loan_proj_in_abs span ctx abs;
             (* Continue *)
             EAbs abs :: explore_env ctx env)
     | b :: env -> b :: explore_env ctx env

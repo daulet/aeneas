@@ -28,21 +28,47 @@ let drop_value (config : config) (span : Meta.span) (p : place) : cm_fun =
       ^ eval_ctx_to_string ~span:(Some span) ctx));
   (* Note that we use [Write], not [Move]: we allow to drop values *below* borrows *)
   let access = Write in
+  let move_place_to_dummy_and_write_bottom (mv : tvalue) (ctx : eval_ctx) :
+      eval_ctx =
+    let dummy_id = ctx.fresh_dummy_var_id () in
+    let ctx = ctx_push_dummy_var ctx dummy_id mv in
+    write_place span access p { mv with value = VBottom } ctx
+  in
+  let outer_shared_loan_to_preserve =
+    match p.kind with
+    | PlaceLocal _ -> (
+        let _, v = InterpPaths.read_place span access p ctx in
+        match
+          InterpBorrowsCore.get_first_outer_loan_or_borrow_in_value false v
+        with
+        | Some (InterpBorrowsCore.LoanContent (VSharedLoan (lid, _))) ->
+            if InterpBorrowsCore.lookup_shared_reserved_borrows lid ctx <> []
+            then Some v
+            else None
+        | Some (InterpBorrowsCore.LoanContent (VMutLoan _))
+        | Some (InterpBorrowsCore.BorrowContent _)
+        | None -> None)
+    | PlaceGlobal _ | PlaceProjection _ -> None
+  in
+  if Option.is_some outer_shared_loan_to_preserve then
+    (* Dropping a local containing a copied shared reference must not end the
+       backing shared loan if another copy is still live. Preserve the local as
+       a dummy binding, as below, but skip prepare_lplace because it would try to
+       end that outer loan. *)
+    let mv = Option.get outer_shared_loan_to_preserve in
+    (move_place_to_dummy_and_write_bottom mv ctx, fun e -> e)
+  else
   (* First make sure we can access the place, by ending loans or expanding
    * symbolic values along the path, for instance *)
   let ctx, cc = update_ctx_along_read_place config span access p ctx in
   (* Prepare the place (by ending the outer loans *at* the place). *)
-  let v, ctx, cc = comp2 cc (prepare_lplace config span p ctx) in
+  let _, ctx, cc = comp2 cc (prepare_lplace config span p ctx) in
   (* Replace the value with {!Bottom} *)
   let ctx =
     (* Move the value at destination (that we will overwrite) to a dummy variable
      * to preserve the borrows it may contain *)
     let _, mv = InterpPaths.read_place span access p ctx in
-    let dummy_id = ctx.fresh_dummy_var_id () in
-    let ctx = ctx_push_dummy_var ctx dummy_id mv in
-    (* Update the destination to ⊥ *)
-    let nv = { v with value = VBottom } in
-    let ctx = write_place span access p nv ctx in
+    let ctx = move_place_to_dummy_and_write_bottom mv ctx in
     [%ltrace
       "place: " ^ place_to_string ctx p ^ "\n- Final context:\n"
       ^ eval_ctx_to_string ~span:(Some span) ctx];

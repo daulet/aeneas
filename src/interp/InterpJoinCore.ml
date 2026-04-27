@@ -724,7 +724,10 @@ let tavalue_add_marker (span : Meta.span) (ctx : eval_ctx) (pm : proj_marker)
   let obj =
     object
       inherit [_] map_tavalue as super
-      method! visit_borrow_content _ _ = [%craise] span "Unexpected borrow"
+      method! visit_borrow_content _ bc =
+        match bc with
+        | VSharedBorrow _ -> bc
+        | VMutBorrow _ | VReservedMutBorrow _ -> [%craise] span "Unexpected borrow"
       method! visit_loan_content _ _ = [%craise] span "Unexpected loan"
 
       method! visit_proj_marker _ pm =
@@ -764,6 +767,7 @@ let tavalue_add_marker (span : Meta.span) (ctx : eval_ctx) (pm : proj_marker)
         | ASharedBorrow (pm0, bid, sid) ->
             [%sanity_check] span (pm0 = PNone);
             super#visit_aborrow_content env (ASharedBorrow (pm, bid, sid))
+        | AProjSharedBorrow _ -> bc
         | _ -> [%internal_error] span
     end
   in

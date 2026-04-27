@@ -1281,7 +1281,7 @@ let destructure_shared_loans (span : Meta.span) (fixed_aids : AbsId.Set.t) :
                 (* Shouldn't find ended borrows in live abstractions *)
                 [%internal_error] span
             | AEndedIgnoredMutBorrow _ -> (bc, [])
-            | AProjSharedBorrow _ -> [%craise] span "Not implemented"
+            | AProjSharedBorrow _ -> (bc, [])
           in
           (ABorrow bc, avl)
       | ASymbolic _ | AIgnored _ -> (av.value, [])

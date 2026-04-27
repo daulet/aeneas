@@ -129,6 +129,10 @@ let eliminate_shared_borrow_markers (span : Meta.span)
     (shared_borrows_seq :
       (abs_id * int * proj_marker * borrow_or_proj * ty) list ref option)
     (ctx : eval_ctx) : eval_ctx =
+  let ty_has_shared_only_borrows ty =
+    (not (ty_no_regions ty))
+    && not (ty_has_mut_borrows ctx.type_ctx.type_infos ty)
+  in
   (* Compute the set of loans without markers *)
   let non_marked_loans, non_marked_loan_projs =
     get_non_marked_shared_loans span ctx
@@ -157,6 +161,9 @@ let eliminate_shared_borrow_markers (span : Meta.span)
                 let pm =
                   let nproj = normalize_symbolic_proj regions proj in
                   if
+                    pm <> PNone && ty_has_shared_only_borrows proj.proj_ty
+                  then PNone
+                  else if
                     pm <> PNone
                     && NormSymbProj.Set.mem nproj non_marked_loan_projs
                   then PNone
@@ -199,7 +206,10 @@ let eliminate_shared_borrow_markers (span : Meta.span)
             [%ldebug "Found symbolic borrow proj:\n" ^ tavalue_to_string ctx av];
             let pm =
               let nproj = normalize_symbolic_proj regions proj in
-              if pm <> PNone && NormSymbProj.Set.mem nproj non_marked_loan_projs
+              if pm <> PNone && ty_has_shared_only_borrows proj.proj_ty then
+                PNone
+              else if
+                pm <> PNone && NormSymbProj.Set.mem nproj non_marked_loan_projs
               then (
                 (* Register the fact that we need to introduce a new shared borrow *)
                 let pm' =
@@ -764,6 +774,7 @@ let reduce_ctx_with_markers (merge_funs : merge_duplicates_funcs option)
         match Map.find_opt loan (Marked.get_borrow_to_abs ctx.info) with
         | None -> (* Nothing to to *) None
         | Some abs_ids1 -> (
+            let abs_ids1 = AbsId.Set.remove abs_id0 abs_ids1 in
             (* We need to merge *)
             match AbsId.Set.elements abs_ids1 with
             | [] -> None
@@ -1189,9 +1200,9 @@ let mk_collapse_ctx_merge_duplicate_funs (span : Meta.span)
       let _, ty0, _ = ty_as_ref ty0 in
       let _, ty1, _ = ty_as_ref ty1 in
       [%sanity_check] span
-        (not (ty_has_borrows (Some span) ctx.type_ctx.type_infos ty0));
+        (not (ty_has_mut_borrows ctx.type_ctx.type_infos ty0));
       [%sanity_check] span
-        (not (ty_has_borrows (Some span) ctx.type_ctx.type_infos ty1))
+        (not (ty_has_mut_borrows ctx.type_ctx.type_infos ty1))
     in
 
     (* Same remarks as for [merge_amut_borrows] *)

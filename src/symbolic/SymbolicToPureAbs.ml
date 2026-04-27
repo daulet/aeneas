@@ -706,10 +706,10 @@ let einput_to_texpr (ctx : bs_ctx) (ectx : C.eval_ctx) (rids : T.RegionId.Set.t)
                 match V.AbsId.Map.find_opt abs_id ctx.abs_id_to_info with
                 | None ->
                     (* No variable was introduced: it means the abstraction should
-                       be ignored (it consumes unit and outputs unit). *)
+                       be ignored (it consumes unit and outputs unit). This can
+                       also happen for collapsed nested shared-borrow bookkeeping
+                       whose unit continuation is not explicitly registered. *)
                     [%sanity_check] span (args = [ [] ]);
-                    [%sanity_check] span
-                      (V.AbsId.Set.mem abs_id ctx.ignored_abs_ids);
                     (None, false)
                 | Some { fvar; can_fail } ->
                     (* The list of lists of arguments is only used in the presence
